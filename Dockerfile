@@ -54,8 +54,8 @@ RUN mkdir -p /app/resume_state /app/vnlr /app/labels /app/dataset
 # Đảm bảo torch + torchvision + torchaudio + torchcodec luôn khớp ABI.
 RUN pip install --no-cache-dir --timeout 300 --retries 5 --upgrade pip wheel setuptools
 
-RUN pip install --no-cache-dir --timeout 600 --retries 5 \
-    --index-url https://download.pytorch.org/whl/cu128 \
+RUN pip install --timeout 600 --retries 5 \
+    --index-url https://download.pytorch.org/whl/cu130 \
     torch torchvision torchaudio torchcodec
 
 # Các Python deps còn lại (đã loại bỏ torch* và triton khỏi requirements.txt)

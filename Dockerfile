@@ -52,14 +52,15 @@ RUN mkdir -p /app/resume_state /app/vnlr /app/labels /app/dataset
 # PyTorch stack — cu128 wheels support Ampere sm_86 (RTX 3060) and later.
 # Không pin version: pip resolver tự chọn bản torch + torchcodec mới nhất trong cu128.
 # Đảm bảo torch + torchvision + torchaudio + torchcodec luôn khớp ABI.
-RUN pip install --no-cache-dir --upgrade pip wheel setuptools \
-    && pip install --no-cache-dir \
+RUN pip install --no-cache-dir --timeout 300 --retries 5 --upgrade pip wheel setuptools
+
+RUN pip install --no-cache-dir --timeout 600 --retries 5 \
         --index-url https://download.pytorch.org/whl/cu128 \
         torch torchvision torchaudio torchcodec
 
 # Các Python deps còn lại (đã loại bỏ torch* và triton khỏi requirements.txt)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --timeout 300 --retries 5 -r requirements.txt
 
 # face_detection + face_alignment (Imperial College, hhj1897)
 RUN git clone https://github.com/hhj1897/face_detection.git /tmp/face_detection \

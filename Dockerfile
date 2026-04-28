@@ -68,6 +68,3 @@ RUN git clone https://github.com/hhj1897/face_detection.git /tmp/face_detection 
 
 RUN git clone https://github.com/hhj1897/face_alignment.git /tmp/face_alignment \
     && pip install -e /tmp/face_alignment
-
-# Copy project code
-COPY . .

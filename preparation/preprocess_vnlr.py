@@ -1,9 +1,11 @@
 import csv
+import math
 import os
 import time
 import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from glob import glob
 import multiprocessing
 from multiprocessing import Manager, Pool
@@ -19,34 +21,103 @@ from torchcodec.decoders import VideoDecoder
 
 from transforms import TextTransform
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Deployment paths ─────────────────────────────────────────────────────────
 DATASET_DIR  = '/app/dataset'
 OUTPUT_DIR   = '/app/vnlr'
 LABELS_DIR   = '/app/labels'
 DONE_LOG     = '/app/resume_state/preprocess_done.txt'
-OOM_LOG      = '/app/resume_state/preprocess_oom_retry.txt'  # files OOM-deferred; run 1-worker retry pass
+OOM_LOG      = '/app/resume_state/preprocess_oom_retry.txt'
 
-NUM_GPUS          = 1
-WORKERS_PER_GPU   = 1     # 2 workers per GPU. Trên GPU 16 GB cần chunk nhỏ — xem dưới.
-DECODE_THREADS    = 4     # per worker — mostly I/O wait, ok to oversubscribe
-CROP_WORKERS      = 6     # per worker — pipeline stage: GPU runs while these crop previous video
-SAVE_THREADS      = 3     # per worker
-PREFETCH_Q        = 16    # decoded frames waiting for GPU
-CROP_Q_DEPTH      = 8     # (frames, landmarks) pairs waiting for crop workers
-SAVE_Q_DEPTH      = 16    # cropped videos waiting to save
-# Chunk size cho normal pass (2 worker chia VRAM). Nếu GPU 24 GB có thể nâng lên 128 / 192.
-DET_CHUNK         = 256    # RetinaFace batch — nhỏ vừa cho 2 worker share GPU 16 GB
-FAN_CHUNK         = 512    # FAN batch — chunk peak VRAM cao nhất, cần giữ thấp khi share GPU
-# Chunk size cho retry pass (1 worker, full VRAM, video bị OOM trước đó)
-RETRY_DET_CHUNK   = 32    # rất bảo thủ — clip bị OOM thường rất dài/HD
-RETRY_FAN_CHUNK   = 48
-USE_FP16          = True
-USE_COMPILE       = False # CUDA Graphs giữ private memory pool gây fragmentation khi share GPU
-USE_NVENC         = False # h264_nvenc tốn 200-500 MiB VRAM trên cùng GPU đang inference
-# OOM-retry behaviour ─────────────────────────────────────────────
-OOM_MAX_ATTEMPTS  = 3     # số lần thử lại 1 video khi gặp CUDA OOM trước khi defer sang retry pass
-OOM_BACKOFF_SEC   = 1.5   # giây chờ giữa các lần retry (cho sibling worker thoát đỉnh peak)
-# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Hardware-adaptive config ──────────────────────────────────────────────────
+@dataclass
+class HWConfig:
+    num_gpus: int
+    workers_per_gpu: int
+    decode_threads: int
+    crop_workers: int
+    save_threads: int
+    prefetch_q: int
+    crop_q_depth: int
+    save_q_depth: int
+    det_chunk: int
+    fan_chunk: int
+    retry_det_chunk: int
+    retry_fan_chunk: int
+    use_fp16: bool
+    use_compile: bool
+    use_nvenc: bool
+    oom_max_attempts: int
+    oom_backoff_sec: float
+
+
+def detect_hardware() -> HWConfig:
+    n_gpus = torch.cuda.device_count()
+    if n_gpus == 0:
+        raise RuntimeError("No CUDA GPUs found.")
+
+    vram_gb = min(
+        torch.cuda.get_device_properties(i).total_memory / 1e9
+        for i in range(n_gpus)
+    )
+    total_cores = psutil.cpu_count(logical=True)
+    ram_gb = psutil.virtual_memory().total / 1e9
+
+    # 2 workers/GPU when VRAM >= 12 GB: GPU is idle ~90% of the time waiting for
+    # decode; a second worker hides that latency with compute overlap.
+    workers_per_gpu = 2 if vram_gb >= 12.0 else 1
+    total_workers = n_gpus * workers_per_gpu
+    cores_per_worker = max(1, total_cores // total_workers)
+
+    if cores_per_worker >= 18:
+        decode_threads, crop_workers, save_threads = 6, 4, 3
+    elif cores_per_worker >= 9:
+        decode_threads, crop_workers, save_threads = 4, 3, 2
+    elif cores_per_worker >= 5:
+        decode_threads, crop_workers, save_threads = 3, 2, 2
+    else:
+        decode_threads, crop_workers, save_threads = 3, 2, 1
+
+    # VRAM budget per worker (subtract ~0.8 GB for model weights + CUDA runtime)
+    vram_budget = (vram_gb / workers_per_gpu) - 0.8
+    bytes_per_det_frame = 1280 * 720 * 3 * 2  # fp16, 720p upper bound
+    raw_det = int(vram_budget * 0.50 * 1e9 / bytes_per_det_frame)
+    det_chunk = min(512, max(16, 2 ** math.floor(math.log2(max(raw_det, 16)))))
+
+    bytes_per_fan_face = (3 * 256 * 256 + 68 * 64 * 64) * 4  # float32 input + heatmaps
+    raw_fan = int(vram_budget * 0.35 * 1e9 / bytes_per_fan_face)
+    fan_chunk = min(1024, max(16, 2 ** math.floor(math.log2(max(raw_fan, 16)))))
+
+    retry_det_chunk = max(16, det_chunk // 8)
+    retry_fan_chunk = max(16, fan_chunk // 8)
+
+    # Queue depths from RAM — each queued video ≈ 400 MB
+    per_worker_queue_gb = (ram_gb * 0.40) / total_workers
+    prefetch_q   = max(8,  min(32, int(per_worker_queue_gb * 1e9 / (400 * 1e6))))
+    crop_q_depth = max(4,  prefetch_q // 2)
+    save_q_depth = max(16, prefetch_q * 2)
+
+    # Enable NVENC on Turing+ (sm_75+); RTX 3060 = Ampere sm_86
+    use_nvenc = any(
+        torch.cuda.get_device_capability(i)[0] >= 7
+        for i in range(n_gpus)
+    )
+    # torch.compile causes CUDA Graph memory fragmentation when workers share a GPU
+    use_compile = (workers_per_gpu == 1 and n_gpus == 1)
+
+    return HWConfig(
+        num_gpus=n_gpus, workers_per_gpu=workers_per_gpu,
+        decode_threads=decode_threads, crop_workers=crop_workers, save_threads=save_threads,
+        prefetch_q=prefetch_q, crop_q_depth=crop_q_depth, save_q_depth=save_q_depth,
+        det_chunk=det_chunk, fan_chunk=fan_chunk,
+        retry_det_chunk=retry_det_chunk, retry_fan_chunk=retry_fan_chunk,
+        use_fp16=True, use_compile=use_compile, use_nvenc=use_nvenc,
+        oom_max_attempts=3, oom_backoff_sec=1.5,
+    )
+
+
+_CFG = detect_hardware()
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def load_video(path):
@@ -109,9 +180,9 @@ def _infer_with_oom_retry(fast_pipeline, frames,
     defer the file to the OOM retry log for a single-worker pass at the end.
     """
     if max_attempts is None:
-        max_attempts = OOM_MAX_ATTEMPTS
+        max_attempts = _CFG.oom_max_attempts
     if backoff_sec is None:
-        backoff_sec = OOM_BACKOFF_SEC
+        backoff_sec = _CFG.oom_backoff_sec
 
     original_det = fast_pipeline.det_chunk
     original_fan = fast_pipeline.fan_chunk
@@ -140,7 +211,7 @@ def _infer_with_oom_retry(fast_pipeline, frames,
 def worker(worker_id, gpu_id, file_chunk, train_set, val_set, test_set,
            done_set, lock, counters, start_time, retry_mode=False):
     # ── CPU pinning ─────────────────────────────────────────────────────────
-    total_workers   = NUM_GPUS * WORKERS_PER_GPU
+    total_workers   = _CFG.num_gpus * _CFG.workers_per_gpu
     total_cores     = psutil.cpu_count(logical=True)
     cores_per_worker = max(1, total_cores // total_workers)
     cpu_start = worker_id * cores_per_worker
@@ -165,9 +236,8 @@ def worker(worker_id, gpu_id, file_chunk, train_set, val_set, test_set,
     video_process = VideoProcess(convert_gray=False)
     tokenizer     = TextTransform()
 
-    # Retry pass dùng chunk nhỏ hơn nhiều — đó là các video đã OOM ở pass chính
-    det_chunk = RETRY_DET_CHUNK if retry_mode else DET_CHUNK
-    fan_chunk = RETRY_FAN_CHUNK if retry_mode else FAN_CHUNK
+    det_chunk = _CFG.retry_det_chunk if retry_mode else _CFG.det_chunk
+    fan_chunk = _CFG.retry_fan_chunk if retry_mode else _CFG.fan_chunk
 
     fast_pipeline = BatchedLandmarkPipeline(
         landmarks_obj.face_detector,
@@ -175,8 +245,8 @@ def worker(worker_id, gpu_id, file_chunk, train_set, val_set, test_set,
         device='cuda:0',
         det_chunk=det_chunk,
         fan_chunk=fan_chunk,
-        fp16=USE_FP16,
-        use_compile=USE_COMPILE,
+        fp16=_CFG.use_fp16,
+        use_compile=_CFG.use_compile,
     )
 
     log_suffix = f"w{worker_id}.retry" if retry_mode else f"w{worker_id}"
@@ -193,7 +263,7 @@ def worker(worker_id, gpu_id, file_chunk, train_set, val_set, test_set,
     initial_done = counters['initial_done']
 
     # ── Stage 1: Decode  ───────────────────────────────────────────────────
-    decode_q = queue.Queue(maxsize=PREFETCH_Q)
+    decode_q = queue.Queue(maxsize=_CFG.prefetch_q)
 
     def decode_one(f):
         name = Path(f).name
@@ -206,7 +276,7 @@ def worker(worker_id, gpu_id, file_chunk, train_set, val_set, test_set,
             decode_q.put((f, 'error', None))
 
     def decode_producer():
-        with ThreadPoolExecutor(max_workers=DECODE_THREADS) as pool:
+        with ThreadPoolExecutor(max_workers=_CFG.decode_threads) as pool:
             for fut in [pool.submit(decode_one, f) for f in file_chunk]:
                 fut.result()
 
@@ -216,10 +286,10 @@ def worker(worker_id, gpu_id, file_chunk, train_set, val_set, test_set,
     # ── Stage 3: Crop  ────────────────────────────────────────────────────
     # KEY: GPU inference puts (frames, landmarks, meta) here;
     # crop workers pick it up so GPU can immediately start the next video.
-    crop_q = queue.Queue(maxsize=CROP_Q_DEPTH)
+    crop_q = queue.Queue(maxsize=_CFG.crop_q_depth)
 
     # ── Stage 4: Save  ────────────────────────────────────────────────────
-    save_q = queue.Queue(maxsize=SAVE_Q_DEPTH)
+    save_q = queue.Queue(maxsize=_CFG.save_q_depth)
 
     def crop_consumer():
         while True:
@@ -300,9 +370,9 @@ def worker(worker_id, gpu_id, file_chunk, train_set, val_set, test_set,
             print(f"[{ts}] {idx}/{total_files} W{worker_id}/G{gpu_id} - OK   {name}", flush=True)
 
     crop_threads = [threading.Thread(target=crop_consumer, daemon=True)
-                    for _ in range(CROP_WORKERS)]
+                    for _ in range(_CFG.crop_workers)]
     save_threads = [threading.Thread(target=save_consumer, daemon=True)
-                    for _ in range(SAVE_THREADS)]
+                    for _ in range(_CFG.save_threads)]
     for t in crop_threads + save_threads:
         t.start()
 
@@ -446,7 +516,7 @@ def load_done_set():
 
     # Absorb leftover shards from previous runs (gpu-style, w-style, and retry-style)
     leftover = 0
-    for w in range(NUM_GPUS * WORKERS_PER_GPU + NUM_GPUS):  # cover both schemes
+    for w in range(_CFG.num_gpus * _CFG.workers_per_gpu + _CFG.num_gpus):  # cover both schemes
         for pat in (f"{DONE_LOG}.w{w}",
                     f"{DONE_LOG}.w{w}.retry",
                     f"{DONE_LOG}.gpu{w}"):
@@ -465,6 +535,19 @@ if __name__ == '__main__':
     multiprocessing.set_start_method('spawn', force=True)
     start = time.time()
 
+    print("=" * 60)
+    print("Hardware config (auto-detected):")
+    print(f"  GPUs: {_CFG.num_gpus}  workers/GPU: {_CFG.workers_per_gpu}"
+          f"  total workers: {_CFG.num_gpus * _CFG.workers_per_gpu}")
+    print(f"  Threads/worker: decode={_CFG.decode_threads}"
+          f"  crop={_CFG.crop_workers}  save={_CFG.save_threads}")
+    print(f"  Batch sizes: DET={_CFG.det_chunk}  FAN={_CFG.fan_chunk}")
+    print(f"  Retry batch: DET={_CFG.retry_det_chunk}  FAN={_CFG.retry_fan_chunk}")
+    print(f"  Queues: prefetch={_CFG.prefetch_q}"
+          f"  crop={_CFG.crop_q_depth}  save={_CFG.save_q_depth}")
+    print(f"  FP16={_CFG.use_fp16}  compile={_CFG.use_compile}  nvenc={_CFG.use_nvenc}")
+    print("=" * 60)
+
     # Create all required directories upfront
     for dirpath in [
         DATASET_DIR,
@@ -478,16 +561,20 @@ if __name__ == '__main__':
             print(f"Created directory: {dirpath}")
 
     # Probe NVENC once so workers know whether to attempt it
-    import numpy as _np
-    _probe = _np.zeros((4, 256, 256, 3), dtype=_np.uint8)
-    try:
-        _write_video_pyav('/tmp/_nvenc_probe.mp4', _probe, 25,
-                          'h264_nvenc', {'preset': 'p1', 'gpu': '0'})
-        print("NVENC: available — using hardware encoding")
-    except Exception as _e:
+    if _CFG.use_nvenc:
+        import numpy as _np
+        _probe = _np.zeros((4, 256, 256, 3), dtype=_np.uint8)
+        try:
+            _write_video_pyav('/tmp/_nvenc_probe.mp4', _probe, 25,
+                              'h264_nvenc', {'preset': 'p1', 'gpu': '0'})
+            print("NVENC: available — using hardware encoding")
+        except Exception as _e:
+            _NVENC_OK = False
+            print(f"NVENC: unavailable ({_e}) — using libx264 ultrafast")
+        del _probe
+    else:
         _NVENC_OK = False
-        print(f"NVENC: unavailable ({_e}) — using libx264 ultrafast")
-    del _probe
+        print("NVENC: disabled by hardware config — using libx264 ultrafast")
 
     files = sorted(glob(f'{DATASET_DIR}/*.mp4'))
     print(f"Found {len(files)} files in {DATASET_DIR}")
@@ -502,9 +589,9 @@ if __name__ == '__main__':
     val_sp, test_sp = train_test_split(temp,     test_size=0.5, random_state=42)
     train_set, val_set, test_set = set(train_sp), set(val_sp), set(test_sp)
 
-    actual_gpus  = min(NUM_GPUS, torch.cuda.device_count())
-    total_workers = actual_gpus * WORKERS_PER_GPU
-    print(f"Launching {total_workers} workers ({actual_gpus} GPUs × {WORKERS_PER_GPU} workers/GPU)")
+    actual_gpus   = _CFG.num_gpus  # detect_hardware() already called device_count()
+    total_workers = actual_gpus * _CFG.workers_per_gpu
+    print(f"Launching {total_workers} workers ({actual_gpus} GPUs × {_CFG.workers_per_gpu} workers/GPU)")
 
     # Round-robin shard so each worker gets evenly-mixed file IDs
     chunks = [files[i::total_workers] for i in range(total_workers)]
@@ -536,8 +623,8 @@ if __name__ == '__main__':
     if oom_files:
         print(f"\n{'='*60}")
         print(f"OOM retry pass: {len(oom_files)} files deferred from main pass")
-        print(f"  → spawning 1 worker with DET_CHUNK={RETRY_DET_CHUNK}, "
-              f"FAN_CHUNK={RETRY_FAN_CHUNK} on GPU 0")
+        print(f"  → spawning 1 worker with DET_CHUNK={_CFG.retry_det_chunk}, "
+              f"FAN_CHUNK={_CFG.retry_fan_chunk} on GPU 0")
         print(f"{'='*60}\n")
 
         # Reload done_set: main pass đã ghi nhiều file mới

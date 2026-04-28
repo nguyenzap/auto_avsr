@@ -1,23 +1,21 @@
-# Base: CUDA 12.6 + cuDNN 9.
-# IMPORTANT: cu126 wheel index hỗ trợ Maxwell→Hopper (bao gồm Volta sm_70 / V100).
-# Wheel cu128/cu130 đã loại bỏ sm_70 — không dùng được trên V100.
-# Tham khảo: https://github.com/pytorch/pytorch/blob/main/RELEASE.md (Release Compatibility Matrix)
-FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
+# Base: CUDA 13.1 + cuDNN, targeting RTX 3060 (Ampere sm_86, max CUDA 13.1).
+# cudnn-devel: needed for cuDNN headers when face_detection/face_alignment build from source,
+# and for cuDNN runtime used by PyTorch (cudnn.benchmark = True in workers).
+# PyTorch cu128 wheels are ABI-compatible with CUDA 13.x at runtime.
+FROM nvidia/cuda:13.1.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 
-# Bypass cuDNN 9 frontend "FIND" path.
-# Phòng hờ trên Volta (V100/Titan V/Quadro GV100): một số bản cuDNN 9.x
-# có thể không tìm được engine convolution cho sm_70 trong torch.jit.trace.
-# Vô hại trên Ampere/Hopper/Ada/Blackwell.
-ENV TORCH_CUDNN_V8_API_DISABLED=1
+# Target Ampere sm_86 explicitly so nvcc only compiles for this architecture.
+# Speeds up any JIT compilation and avoids generating unused PTX/SASS for older arches.
+ENV TORCH_CUDA_ARCH_LIST="8.6"
 
 # Giảm fragmentation cho cấp phát CUDA của PyTorch.
 # expandable_segments=True cho phép caching allocator nới rộng segment hiện có
 # thay vì giữ nguyên các block đã reserve nhưng không cấp phát được — giải pháp
-# trực tiếp cho lỗi "1.48 GiB reserved by PyTorch but unallocated" trên GPU 16 GB.
+# trực tiếp cho lỗi "1.48 GiB reserved by PyTorch but unallocated" trên GPU 12 GB.
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # OS deps tối thiểu (đã loại nasm/yasm/x264-dev/x265-dev — không còn build FFmpeg)
@@ -51,12 +49,12 @@ RUN curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key \
 
 WORKDIR /app
 RUN mkdir -p /app/resume_state /app/vnlr /app/labels /app/dataset
-# PyTorch stack — cài từ cu126 wheel index trước các deps khác.
-# Không pin version: pip resolver tự chọn bản torch + torchcodec mới nhất trong cu126.
+# PyTorch stack — cu128 wheels support Ampere sm_86 (RTX 3060) and later.
+# Không pin version: pip resolver tự chọn bản torch + torchcodec mới nhất trong cu128.
 # Đảm bảo torch + torchvision + torchaudio + torchcodec luôn khớp ABI.
 RUN pip install --no-cache-dir --upgrade pip wheel setuptools \
     && pip install --no-cache-dir \
-        --index-url https://download.pytorch.org/whl/cu126 \
+        --index-url https://download.pytorch.org/whl/cu128 \
         torch torchvision torchaudio torchcodec
 
 # Các Python deps còn lại (đã loại bỏ torch* và triton khỏi requirements.txt)

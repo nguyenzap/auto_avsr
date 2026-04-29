@@ -1,3 +1,4 @@
+import argparse
 import csv
 import math
 import os
@@ -21,12 +22,11 @@ from torchcodec.decoders import VideoDecoder
 
 from transforms import TextTransform
 
-# ── Deployment paths ─────────────────────────────────────────────────────────
-DATASET_DIR  = '/app/dataset'
-OUTPUT_DIR   = '/app/vnlr'
-LABELS_DIR   = '/app/labels'
-DONE_LOG     = '/app/resume_state/preprocess_done.txt'
-OOM_LOG      = '/app/resume_state/preprocess_oom_retry.txt'
+DATASET_DIR  = ''
+OUTPUT_DIR   = ''
+LABELS_DIR   = ''
+DONE_LOG     = ''
+OOM_LOG      = ''
 
 
 # ── Hardware-adaptive config ──────────────────────────────────────────────────
@@ -51,7 +51,7 @@ class HWConfig:
     oom_backoff_sec: float
 
 
-def detect_hardware() -> HWConfig:
+def detect_hardware(num_cores: int = None) -> HWConfig:
     n_gpus = torch.cuda.device_count()
     if n_gpus == 0:
         raise RuntimeError("No CUDA GPUs found.")
@@ -60,12 +60,13 @@ def detect_hardware() -> HWConfig:
         torch.cuda.get_device_properties(i).total_memory / 1e9
         for i in range(n_gpus)
     )
-    total_cores = psutil.cpu_count(logical=True)
+    total_cores = num_cores if num_cores else psutil.cpu_count(logical=True)
     ram_gb = psutil.virtual_memory().total / 1e9
 
-    # 2 workers/GPU when VRAM >= 12 GB: GPU is idle ~90% of the time waiting for
-    # decode; a second worker hides that latency with compute overlap.
-    workers_per_gpu = 2 if vram_gb >= 12.0 else 1
+    # 2 workers/GPU only when VRAM >= 32 GB — below that the sibling worker's peak
+    # allocation overlaps with the other's, causing OOM even when average usage looks fine.
+    # At 24 GB (RTX 3090): 1 worker uses the full card safely with large batch sizes.
+    workers_per_gpu = 2 if vram_gb >= 32.0 else 1
     total_workers = n_gpus * workers_per_gpu
     cores_per_worker = max(1, total_cores // total_workers)
 
@@ -78,14 +79,19 @@ def detect_hardware() -> HWConfig:
     else:
         decode_threads, crop_workers, save_threads = 3, 2, 1
 
-    # VRAM budget per worker (subtract ~0.8 GB for model weights + CUDA runtime)
-    vram_budget = (vram_gb / workers_per_gpu) - 0.8
+    # VRAM budget per worker. Overhead per worker:
+    #   CUDA context: ~500 MB, model weights (RetinaFace+FAN): ~700 MB,
+    #   cuDNN workspace + activation buffers + fragmentation headroom: ~800 MB
+    #   Total: ~2 GB reserved before any batch allocation.
+    # Use only 35% of remaining budget for DET and 25% for FAN since both
+    # tensors can be live simultaneously during pipeline execution.
+    vram_budget = (vram_gb / workers_per_gpu) - 2.0
     bytes_per_det_frame = 1280 * 720 * 3 * 2  # fp16, 720p upper bound
-    raw_det = int(vram_budget * 0.50 * 1e9 / bytes_per_det_frame)
+    raw_det = int(vram_budget * 0.35 * 1e9 / bytes_per_det_frame)
     det_chunk = min(512, max(16, 2 ** math.floor(math.log2(max(raw_det, 16)))))
 
     bytes_per_fan_face = (3 * 256 * 256 + 68 * 64 * 64) * 4  # float32 input + heatmaps
-    raw_fan = int(vram_budget * 0.35 * 1e9 / bytes_per_fan_face)
+    raw_fan = int(vram_budget * 0.25 * 1e9 / bytes_per_fan_face)
     fan_chunk = min(1024, max(16, 2 ** math.floor(math.log2(max(raw_fan, 16)))))
 
     retry_det_chunk = max(16, det_chunk // 8)
@@ -209,7 +215,13 @@ def _infer_with_oom_retry(fast_pipeline, frames,
 
 
 def worker(worker_id, gpu_id, file_chunk, train_set, val_set, test_set,
-           done_set, lock, counters, start_time, retry_mode=False):
+           done_set, lock, counters, start_time, retry_mode=False,
+           output_dir=None, labels_dir=None, done_log_path=None, oom_log_path=None):
+    global OUTPUT_DIR, LABELS_DIR, DONE_LOG, OOM_LOG
+    if output_dir   is not None: OUTPUT_DIR = output_dir
+    if labels_dir   is not None: LABELS_DIR = labels_dir
+    if done_log_path is not None: DONE_LOG  = done_log_path
+    if oom_log_path  is not None: OOM_LOG   = oom_log_path
     # ── CPU pinning ─────────────────────────────────────────────────────────
     total_workers   = _CFG.num_gpus * _CFG.workers_per_gpu
     total_cores     = psutil.cpu_count(logical=True)
@@ -457,33 +469,33 @@ def _shard_suffixes(num_workers):
     return suffixes
 
 
-def merge_shards(num_workers):
+def merge_shards(num_workers, labels_dir, done_log):
     """Merge per-worker CSV + done-log shards into the canonical files.
     Bao gồm cả shard từ retry pass (suffix '.retry').
     """
     suffixes = _shard_suffixes(num_workers)
     for split in ('train', 'val', 'test'):
-        with open(f"{LABELS_DIR}/{split}.csv", "a") as out:
+        with open(f"{labels_dir}/{split}.csv", "a") as out:
             for sfx in suffixes:
-                shard = f"{LABELS_DIR}/{split}_{sfx}.csv"
+                shard = f"{labels_dir}/{split}_{sfx}.csv"
                 if os.path.exists(shard):
                     with open(shard) as inp:
                         out.write(inp.read())
                     os.remove(shard)
-    with open(DONE_LOG, "a") as out:
+    with open(done_log, "a") as out:
         for sfx in suffixes:
-            shard = f"{DONE_LOG}.{sfx}"
+            shard = f"{done_log}.{sfx}"
             if os.path.exists(shard):
                 with open(shard) as inp:
                     out.write(inp.read())
                 os.remove(shard)
 
 
-def collect_oom_files(num_workers):
+def collect_oom_files(num_workers, oom_log):
     """Read & remove per-worker OOM shards. Returns list of full file paths."""
     files = []
     for w in range(num_workers):
-        shard = f"{OOM_LOG}.w{w}"
+        shard = f"{oom_log}.w{w}"
         if os.path.exists(shard):
             with open(shard) as inp:
                 files.extend(line.strip() for line in inp if line.strip())
@@ -497,7 +509,7 @@ def collect_oom_files(num_workers):
     return unique
 
 
-def load_done_set():
+def load_done_set(done_log):
     """Aggressively load every possible done-log location so resume always works."""
     done_set = set()
     paths_checked = []
@@ -511,15 +523,15 @@ def load_done_set():
             return len(added)
         return 0
 
-    main_count = absorb(DONE_LOG)
-    print(f"  main done log [{DONE_LOG}]: {main_count} entries")
+    main_count = absorb(done_log)
+    print(f"  main done log [{done_log}]: {main_count} entries")
 
     # Absorb leftover shards from previous runs (gpu-style, w-style, and retry-style)
     leftover = 0
     for w in range(_CFG.num_gpus * _CFG.workers_per_gpu + _CFG.num_gpus):  # cover both schemes
-        for pat in (f"{DONE_LOG}.w{w}",
-                    f"{DONE_LOG}.w{w}.retry",
-                    f"{DONE_LOG}.gpu{w}"):
+        for pat in (f"{done_log}.w{w}",
+                    f"{done_log}.w{w}.retry",
+                    f"{done_log}.gpu{w}"):
             if os.path.exists(pat):
                 leftover += absorb(pat)
     if leftover:
@@ -529,6 +541,23 @@ def load_done_set():
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Preprocess VNLR dataset')
+    parser.add_argument('--dataset-dir',  required=True,  help='Directory containing input .mp4 files')
+    parser.add_argument('--output-dir',   required=True,  help='Directory for processed video/text output')
+    parser.add_argument('--labels-dir',   required=True,  help='Directory for CSV label files')
+    parser.add_argument('--resume-dir',   required=True,  help='Directory for resume/OOM state files')
+    parser.add_argument('--num-cores',    type=int, default=None, help='Override detected CPU core count (useful when instance limits cores below psutil\'s report)')
+    args = parser.parse_args()
+
+    DATASET_DIR = args.dataset_dir
+    OUTPUT_DIR  = args.output_dir
+    LABELS_DIR  = args.labels_dir
+    DONE_LOG    = f"{args.resume_dir}/preprocess_done.txt"
+    OOM_LOG     = f"{args.resume_dir}/preprocess_oom_retry.txt"
+
+    if args.num_cores:
+        _CFG = detect_hardware(num_cores=args.num_cores)
+
     # 'spawn' creates clean child processes with no inherited CUDA state.
     # 'fork' (Linux default) copies the parent's file descriptors and can
     # corrupt the CUDA driver context that torch initialises at import time.
@@ -539,6 +568,8 @@ if __name__ == '__main__':
     print("Hardware config (auto-detected):")
     print(f"  GPUs: {_CFG.num_gpus}  workers/GPU: {_CFG.workers_per_gpu}"
           f"  total workers: {_CFG.num_gpus * _CFG.workers_per_gpu}")
+    print(f"  CPU cores: {psutil.cpu_count(logical=True)}"
+          f"  cores/worker: {max(1, psutil.cpu_count(logical=True) // (_CFG.num_gpus * _CFG.workers_per_gpu))}")
     print(f"  Threads/worker: decode={_CFG.decode_threads}"
           f"  crop={_CFG.crop_workers}  save={_CFG.save_threads}")
     print(f"  Batch sizes: DET={_CFG.det_chunk}  FAN={_CFG.fan_chunk}")
@@ -548,17 +579,17 @@ if __name__ == '__main__':
     print(f"  FP16={_CFG.use_fp16}  compile={_CFG.use_compile}  nvenc={_CFG.use_nvenc}")
     print("=" * 60)
 
-    # Create all required directories upfront
+    # Create all output directories upfront
     for dirpath in [
-        DATASET_DIR,
         f"{OUTPUT_DIR}/video",
         f"{OUTPUT_DIR}/text",
         LABELS_DIR,
         str(Path(DONE_LOG).parent),
     ]:
-        if not os.path.exists(dirpath):
-            os.makedirs(dirpath, exist_ok=True)
-            print(f"Created directory: {dirpath}")
+        os.makedirs(dirpath, exist_ok=True)
+
+    if not os.path.exists(DATASET_DIR):
+        raise FileNotFoundError(f"Dataset directory not found: {DATASET_DIR}")
 
     # Probe NVENC once so workers know whether to attempt it
     if _CFG.use_nvenc:
@@ -580,14 +611,21 @@ if __name__ == '__main__':
     print(f"Found {len(files)} files in {DATASET_DIR}")
 
     print("\nLoading resume state:")
-    done_set = load_done_set()
+    done_set = load_done_set(DONE_LOG)
     print(f"  → {len(done_set)} files already processed (will be skipped)\n")
 
-    # Speaker split
+    # Speaker split — skipped when dataset is empty or too small to split;
+    # all files go to train so preprocessing can proceed and the split can be done later.
     speakers = sorted(set(Path(f).stem.rsplit('_', 1)[0] for f in files))
-    train_sp, temp  = train_test_split(speakers, test_size=0.2, random_state=42)
-    val_sp, test_sp = train_test_split(temp,     test_size=0.5, random_state=42)
-    train_set, val_set, test_set = set(train_sp), set(val_sp), set(test_sp)
+    if len(speakers) >= 5:
+        train_sp, temp  = train_test_split(speakers, test_size=0.2, random_state=42)
+        val_sp, test_sp = train_test_split(temp,     test_size=0.5, random_state=42)
+        train_set, val_set, test_set = set(train_sp), set(val_sp), set(test_sp)
+    else:
+        print(f"  ⚠ Only {len(speakers)} speaker(s) found — skipping train/val/test split, "
+              f"all files go to train. Re-run split manually after preprocessing.")
+        train_set = set(Path(f).stem.rsplit('_', 1)[0] for f in files)
+        val_set, test_set = set(), set()
 
     actual_gpus   = _CFG.num_gpus  # detect_hardware() already called device_count()
     total_workers = actual_gpus * _CFG.workers_per_gpu
@@ -613,13 +651,14 @@ if __name__ == '__main__':
                 train_set, val_set, test_set,
                 done_set, lock, counters, start,
                 False,  # retry_mode
+                OUTPUT_DIR, LABELS_DIR, DONE_LOG, OOM_LOG,
             ))
 
         with Pool(processes=total_workers) as pool:
             pool.starmap(worker, args)
 
     # ── OOM retry pass: 1 worker, full VRAM, chunk size rất nhỏ ──────────
-    oom_files = collect_oom_files(total_workers)
+    oom_files = collect_oom_files(total_workers, OOM_LOG)
     if oom_files:
         print(f"\n{'='*60}")
         print(f"OOM retry pass: {len(oom_files)} files deferred from main pass")
@@ -628,7 +667,7 @@ if __name__ == '__main__':
         print(f"{'='*60}\n")
 
         # Reload done_set: main pass đã ghi nhiều file mới
-        done_set_retry = load_done_set()
+        done_set_retry = load_done_set(DONE_LOG)
 
         with Manager() as manager:
             lock_r = manager.Lock()
@@ -642,13 +681,14 @@ if __name__ == '__main__':
                 train_set, val_set, test_set,
                 done_set_retry, lock_r, counters_r, time.time(),
                 True,  # retry_mode
+                OUTPUT_DIR, LABELS_DIR, DONE_LOG, OOM_LOG,
             )]
             with Pool(processes=1) as pool:
                 pool.starmap(worker, retry_args)
     else:
         print("\nNo OOM-deferred files — retry pass skipped.")
 
-    merge_shards(total_workers)
+    merge_shards(total_workers, LABELS_DIR, DONE_LOG)
 
     elapsed = time.time() - start
     print(f"\nDone in {time.strftime('%H:%M:%S', time.gmtime(elapsed))}")

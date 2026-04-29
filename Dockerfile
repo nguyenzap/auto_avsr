@@ -1,16 +1,12 @@
-# Base: CUDA 13.0 + cuDNN, targeting RTX 4060 Ti (Ada Lovelace sm_89).
+# Base: CUDA 12.6 + cuDNN, compatible with GPUs supporting max CUDA 12.6 driver.
 # cudnn-devel: needed for cuDNN headers when face_detection/face_alignment build from source,
 # and for cuDNN runtime used by PyTorch (cudnn.benchmark = True in workers).
-# PyTorch cu128 wheels are ABI-compatible with CUDA 13.x at runtime.
-FROM nvidia/cuda:13.0.3-cudnn-devel-ubuntu22.04
+FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 
-# Target Ada Lovelace sm_89 explicitly so nvcc only compiles for this architecture.
-# Speeds up any JIT compilation and avoids generating unused PTX/SASS for older arches.
-ENV TORCH_CUDA_ARCH_LIST="8.9"
 
 # Giảm fragmentation cho cấp phát CUDA của PyTorch.
 # expandable_segments=True cho phép caching allocator nới rộng segment hiện có
@@ -49,13 +45,13 @@ RUN curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key \
 
 WORKDIR /app
 RUN mkdir -p /app/resume_state /app/vnlr /app/labels /app/dataset
-# PyTorch stack — cu128 wheels support Ada Lovelace sm_89 (RTX 4060 Ti) and later.
-# Không pin version: pip resolver tự chọn bản torch + torchcodec mới nhất trong cu128.
+# PyTorch stack — cu126 wheels support Maxwell→Hopper (sm_50 through sm_90).
+# Không pin version: pip resolver tự chọn bản torch + torchcodec mới nhất trong cu126.
 # Đảm bảo torch + torchvision + torchaudio + torchcodec luôn khớp ABI.
 RUN pip install --no-cache-dir --timeout 300 --retries 5 --upgrade pip wheel setuptools
 
 RUN pip install --timeout 600 --retries 5 \
-    --index-url https://download.pytorch.org/whl/cu130 \
+    --index-url https://download.pytorch.org/whl/cu126 \
     torch torchvision torchaudio torchcodec
 
 # Các Python deps còn lại (đã loại bỏ torch* và triton khỏi requirements.txt)
